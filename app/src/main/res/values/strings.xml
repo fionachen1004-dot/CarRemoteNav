@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">遙控器焦點導覽</string>
+    <string name="service_desc">讓遙控器的方向鍵、確定鍵像 Google TV 一樣移動焦點框並點選畫面上的按鈕。</string>
+</resources>
