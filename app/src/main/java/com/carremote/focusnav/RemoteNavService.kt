@@ -29,6 +29,7 @@ class RemoteNavService : AccessibilityService() {
     companion object {
         @Volatile var instance: RemoteNavService? = null
         @Volatile var lastKey: String = ""
+        @Volatile var lastInfo: String = ""
         @Volatile var navEnabled: Boolean = true
 
         private const val PREFS = "cfg"
@@ -253,13 +254,20 @@ class RemoteNavService : AccessibilityService() {
         if (cur == null) {
             val dm = resources.displayMetrics
             val first = pickNearest(cands, dm.widthPixels / 2f, dm.heightPixels / 2f)
-            if (first != null) setFocus(first, false) else overlay?.pulse()
+            if (first != null) {
+                setFocus(first, false)
+                lastInfo = "選到第一個項目（共找到 ${cands.size} 個可點項目）"
+            } else {
+                lastInfo = "這個畫面找不到任何可點項目（App 沒有公開按鈕資訊）"
+                overlay?.pulse()
+            }
             return
         }
 
         val next = pickDirectional(cands, cur, dir)
         if (next != null) {
             setFocus(next, true)
+            lastInfo = "移動焦點（共找到 ${cands.size} 個可點項目）"
             return
         }
         // 這個方向沒有項目了 → 嘗試捲動
@@ -449,51 +457,116 @@ class RemoteNavService : AccessibilityService() {
 
     // ───────────────────────── 捲動 ─────────────────────────
 
+    /**
+     * 往 dir 方向捲動。依序嘗試：
+     * 1. 具體方向的捲動動作（SCROLL_UP/DOWN/LEFT/RIGHT）
+     * 2. 通用的 SCROLL_FORWARD / SCROLL_BACKWARD（很多 App 只提供這個）
+     * 3. 都不行就在畫面上模擬手指滑動
+     */
     private fun tryScroll(dir: Int): Boolean {
-        val action = when (dir) {
-            UP -> AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_UP
-            DOWN -> AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_DOWN
-            LEFT -> AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_LEFT
-            else -> AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_RIGHT
+        val specific = when (dir) {
+            UP -> AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_UP.id
+            DOWN -> AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_DOWN.id
+            LEFT -> AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_LEFT.id
+            else -> AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_RIGHT.id
         }
-        val root = rootInActiveWindow ?: return false
+        val generic = if (dir == DOWN || dir == RIGHT) {
+            AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
+        } else {
+            AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+        }
+        val vertical = dir == UP || dir == DOWN
+
         val matches = ArrayList<Pair<AccessibilityNodeInfo, Rect>>()
-        findScrollable(root, action.id, matches, 0, intArrayOf(4000))
-        if (matches.isEmpty()) return false
+        rootInActiveWindow?.let { findScrollable(it, specific, generic, matches, 0, intArrayOf(4000)) }
 
         val cur = current
-        val inside: List<Pair<AccessibilityNodeInfo, Rect>> = if (cur == null) {
-            emptyList()
-        } else {
-            matches.filter { it.second.contains(cur.centerX(), cur.centerY()) }
-        }
-        val pick = inside.minByOrNull { it.second.width().toLong() * it.second.height() }
-            ?: matches.maxByOrNull { it.second.width().toLong() * it.second.height() }
-            ?: return false
+        var container: Rect? = null
+        var done = false
 
-        if (!pick.first.performAction(action.id)) return false
-        overlay?.pulse()
-        handler.postDelayed({ afterScroll() }, 450)
-        return true
+        if (matches.isNotEmpty()) {
+            val exact = matches.filter { m -> m.first.actionList.any { it.id == specific } }
+            val pool = if (exact.isNotEmpty()) exact else matches
+            val inside: List<Pair<AccessibilityNodeInfo, Rect>> = if (cur == null) {
+                emptyList()
+            } else {
+                pool.filter { it.second.contains(cur.centerX(), cur.centerY()) }
+            }
+            val pick: Pair<AccessibilityNodeInfo, Rect>? = if (exact.isNotEmpty()) {
+                // 有明確方向的動作：取包住焦點框的最內層，否則取最大的
+                inside.minByOrNull { it.second.width().toLong() * it.second.height() }
+                    ?: pool.maxByOrNull { it.second.width().toLong() * it.second.height() }
+            } else {
+                // 只有前進／後退：垂直方向取最高的、水平方向取最寬的，避免誤捲橫向列
+                val extent = { r: Rect -> if (vertical) r.height() else r.width() }
+                (if (inside.isNotEmpty()) inside else pool).maxByOrNull { extent(it.second) }
+            }
+            if (pick != null) {
+                container = pick.second
+                val useAction = if (pick.first.actionList.any { it.id == specific }) specific else generic
+                done = pick.first.performAction(useAction)
+                lastInfo = if (done) "已用捲動指令捲動" else "捲動指令被 App 拒絕，改用手指滑動"
+            }
+        }
+
+        if (!done) {
+            done = swipe(dir, container)
+            lastInfo = if (done) "已模擬手指滑動來捲動" else "無法捲動這個畫面"
+        }
+
+        if (done) {
+            overlay?.pulse()
+            handler.postDelayed({ afterScroll() }, 600)
+        }
+        return done
     }
 
     private fun findScrollable(
         n: AccessibilityNodeInfo,
-        actionId: Int,
+        specific: Int,
+        generic: Int,
         out: MutableList<Pair<AccessibilityNodeInfo, Rect>>,
         depth: Int,
         budget: IntArray
     ) {
         if (budget[0]-- <= 0 || depth > 60) return
         if (!n.isVisibleToUser) return
-        if (n.isScrollable && n.actionList.any { it.id == actionId }) {
+        if (n.isScrollable && n.actionList.any { it.id == specific || it.id == generic }) {
             val r = Rect()
             n.getBoundsInScreen(r)
             out.add(Pair(n, r))
         }
         for (i in 0 until n.childCount) {
             val c = n.getChild(i) ?: continue
-            findScrollable(c, actionId, out, depth + 1, budget)
+            findScrollable(c, specific, generic, out, depth + 1, budget)
+        }
+    }
+
+    /** 在容器（沒有就用整個畫面）範圍內模擬手指滑動，滑動量約為容器高（寬）的一半。 */
+    private fun swipe(dir: Int, container: Rect?): Boolean {
+        val dm = resources.displayMetrics
+        val area = Rect(0, 0, dm.widthPixels, dm.heightPixels)
+        val box = Rect(container ?: area)
+        if (!box.intersect(area) || box.width() < 40 || box.height() < 40) box.set(area)
+
+        val x = box.exactCenterX()
+        val y = box.exactCenterY()
+        val dx = box.width() * 0.25f
+        val dy = box.height() * 0.25f
+        val p = Path()
+        when (dir) {
+            DOWN -> { p.moveTo(x, y + dy); p.lineTo(x, y - dy) }   // 內容往上走＝往下捲
+            UP -> { p.moveTo(x, y - dy); p.lineTo(x, y + dy) }
+            RIGHT -> { p.moveTo(x + dx, y); p.lineTo(x - dx, y) }
+            else -> { p.moveTo(x - dx, y); p.lineTo(x + dx, y) }
+        }
+        return try {
+            val g = GestureDescription.Builder()
+                .addStroke(GestureDescription.StrokeDescription(p, 0, 350L))
+                .build()
+            dispatchGesture(g, null, null)
+        } catch (e: Exception) {
+            false
         }
     }
 
@@ -505,17 +578,6 @@ class RemoteNavService : AccessibilityService() {
     }
 
     private fun pageScroll(dir: Int) {
-        if (tryScroll(dir)) return
-        val dm = resources.displayMetrics
-        val w = dm.widthPixels.toFloat()
-        val h = dm.heightPixels.toFloat()
-        val p = Path()
-        when (dir) {
-            DOWN -> { p.moveTo(w / 2, h * 0.7f); p.lineTo(w / 2, h * 0.3f) }
-            UP -> { p.moveTo(w / 2, h * 0.3f); p.lineTo(w / 2, h * 0.7f) }
-            LEFT -> { p.moveTo(w * 0.3f, h / 2); p.lineTo(w * 0.7f, h / 2) }
-            else -> { p.moveTo(w * 0.7f, h / 2); p.lineTo(w * 0.3f, h / 2) }
-        }
-        gesture(p, 300L)
+        tryScroll(dir)
     }
 }

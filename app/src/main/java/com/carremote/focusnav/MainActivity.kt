@@ -19,6 +19,7 @@ class MainActivity : Activity() {
 
     private lateinit var statusView: TextView
     private lateinit var keyView: TextView
+    private lateinit var infoView: TextView
     private val handler = Handler(Looper.getMainLooper())
 
     private val tick = object : Runnable {
@@ -45,6 +46,9 @@ class MainActivity : Activity() {
 
         keyView = text("", 20f)
         root.addView(keyView)
+
+        infoView = text("", 20f)
+        root.addView(infoView)
 
         val toggle = Switch(this).apply {
             text = "啟用遙控器焦點導覽"
@@ -108,6 +112,8 @@ class MainActivity : Activity() {
         }
         val last = RemoteNavService.lastKey
         keyView.text = "最後按鍵：" + (if (last.isEmpty()) "（尚未收到）" else last)
+        val info = RemoteNavService.lastInfo
+        infoView.text = "最後動作：" + (if (info.isEmpty()) "（尚無）" else info)
     }
 
     private fun text(s: String, sp: Float, bold: Boolean = false): TextView =
