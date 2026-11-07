@@ -31,9 +31,11 @@ class RemoteNavService : AccessibilityService() {
         @Volatile var lastKey: String = ""
         @Volatile var lastInfo: String = ""
         @Volatile var navEnabled: Boolean = true
+        @Volatile var debugBoxes: Boolean = false
 
         private const val PREFS = "cfg"
         private const val KEY_ENABLED = "enabled"
+        private const val KEY_DEBUG = "debug"
 
         private const val UP = 0
         private const val DOWN = 1
@@ -44,8 +46,16 @@ class RemoteNavService : AccessibilityService() {
         private const val LONG_PRESS_MS = 600L
 
         fun loadPrefs(ctx: Context) {
-            navEnabled = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-                .getBoolean(KEY_ENABLED, true)
+            val sp = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            navEnabled = sp.getBoolean(KEY_ENABLED, true)
+            debugBoxes = sp.getBoolean(KEY_DEBUG, false)
+        }
+
+        fun applyDebug(ctx: Context, on: Boolean) {
+            debugBoxes = on
+            ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit().putBoolean(KEY_DEBUG, on).apply()
+            if (!on) instance?.clearDebug()
         }
 
         fun applyEnabled(ctx: Context, on: Boolean) {
@@ -56,7 +66,7 @@ class RemoteNavService : AccessibilityService() {
         }
     }
 
-    private class Cand(val node: AccessibilityNodeInfo, val rect: Rect)
+    private class Cand(val node: AccessibilityNodeInfo, val rect: Rect, val soft: Boolean = false)
 
     private val handler = Handler(Looper.getMainLooper())
     private var overlay: FocusOverlayView? = null
@@ -125,6 +135,13 @@ class RemoteNavService : AccessibilityService() {
         frameVisible = false
         if (instance === this) instance = null
     }
+
+    fun clearDebug() {
+        overlay?.setDebug(emptyList(), emptyList())
+    }
+
+    private fun countText(c: List<Cand>): String =
+        "可點 ${c.count { !it.soft }} 個、文字 ${c.count { it.soft }} 個"
 
     fun onToggled() {
         if (!navEnabled) {
@@ -205,7 +222,10 @@ class RemoteNavService : AccessibilityService() {
 
     private fun onDirection(dir: Int, event: KeyEvent): Boolean {
         // 正在打字時，左右鍵留給輸入框移動游標
-        if ((dir == LEFT || dir == RIGHT) && editingText()) return false
+        if ((dir == LEFT || dir == RIGHT) && editingText()) {
+            lastInfo = "偵測到正在輸入文字，左右鍵交給輸入框"
+            return false
+        }
         if (event.action != KeyEvent.ACTION_DOWN) return true
         val now = SystemClock.uptimeMillis()
         if (event.repeatCount > 0 && now - lastMoveAt < 140) return true
@@ -238,6 +258,12 @@ class RemoteNavService : AccessibilityService() {
 
     private fun handleDirection(dir: Int) {
         val cands = collect()
+        if (debugBoxes) {
+            overlay?.setDebug(
+                cands.filter { !it.soft }.map { it.rect },
+                cands.filter { it.soft }.map { it.rect }
+            )
+        }
 
         if (current != null) {
             if (!syncCurrent(cands)) {
@@ -256,7 +282,7 @@ class RemoteNavService : AccessibilityService() {
             val first = pickNearest(cands, dm.widthPixels / 2f, dm.heightPixels / 2f)
             if (first != null) {
                 setFocus(first, false)
-                lastInfo = "選到第一個項目（共找到 ${cands.size} 個可點項目）"
+                lastInfo = "選到第一個項目（${countText(cands)}）"
             } else {
                 lastInfo = "這個畫面找不到任何可點項目（App 沒有公開按鈕資訊）"
                 overlay?.pulse()
@@ -267,7 +293,7 @@ class RemoteNavService : AccessibilityService() {
         val next = pickDirectional(cands, cur, dir)
         if (next != null) {
             setFocus(next, true)
-            lastInfo = "移動焦點（共找到 ${cands.size} 個可點項目）"
+            lastInfo = "移動焦點（${countText(cands)}）"
             return
         }
         // 這個方向沒有項目了 → 嘗試捲動
@@ -334,10 +360,10 @@ class RemoteNavService : AccessibilityService() {
             val dx = r.exactCenterX() - cx
             val dy = r.exactCenterY() - cy
             val inDir = when (dir) {
-                UP -> dy < -4f && r.top < cur.top
-                DOWN -> dy > 4f && r.bottom > cur.bottom
-                LEFT -> dx < -4f && r.left < cur.left
-                else -> dx > 4f && r.right > cur.right
+                UP -> dy < -4f
+                DOWN -> dy > 4f
+                LEFT -> dx < -4f
+                else -> dx > 4f
             }
             if (!inDir) continue
             val major = (if (vertical) abs(dy) else abs(dx)).toDouble()
@@ -348,7 +374,7 @@ class RemoteNavService : AccessibilityService() {
                 min(r.bottom, cur.bottom) - max(r.top, cur.top)
             }
             if (overlap > 0) minor *= 0.25 // 與目前項目在同一行／列，優先
-            val score = major + 2.0 * minor
+            val score = major + 2.0 * minor + (if (c.soft) 40.0 else 0.0)
             if (score < bestScore) {
                 bestScore = score
                 best = c
@@ -375,11 +401,11 @@ class RemoteNavService : AccessibilityService() {
         val dm = resources.displayMetrics
         val screenArea = dm.widthPixels.toLong() * dm.heightPixels.toLong()
         val budget = intArrayOf(4000)
-        rootInActiveWindow?.let { walk(it, out, screenArea, 0, budget) }
+        rootInActiveWindow?.let { walk(it, out, screenArea, 0, budget, false) }
         try {
             for (w in windows) {
                 if (w.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD) {
-                    w.root?.let { walk(it, out, screenArea, 0, budget) }
+                    w.root?.let { walk(it, out, screenArea, 0, budget, false) }
                 }
             }
         } catch (e: Exception) {
@@ -387,21 +413,43 @@ class RemoteNavService : AccessibilityService() {
         return out.distinctBy { it.rect.flattenToString() }
     }
 
-    private fun walk(n: AccessibilityNodeInfo, out: MutableList<Cand>, screenArea: Long, depth: Int, budget: IntArray) {
+    private fun walk(
+        n: AccessibilityNodeInfo,
+        out: MutableList<Cand>,
+        screenArea: Long,
+        depth: Int,
+        budget: IntArray,
+        ancestorActionable: Boolean
+    ) {
         if (budget[0]-- <= 0 || depth > 60) return
         if (!n.isVisibleToUser) return
         val r = Rect()
         n.getBoundsInScreen(r)
+        var added = false
         if (r.width() >= 12 && r.height() >= 12) {
             val area = r.width().toLong() * r.height()
             val nearlyFullScreen = area * 10 >= screenArea * 8
-            if (!nearlyFullScreen && n.isEnabled && isActionable(n)) out.add(Cand(n, r))
+            if (!nearlyFullScreen && n.isEnabled) {
+                if (isActionable(n)) {
+                    out.add(Cand(n, r))
+                    added = true
+                } else if (!ancestorActionable && n.childCount == 0 &&
+                    r.width() >= 24 && r.height() >= 24 && hasLabel(n)
+                ) {
+                    // App 沒把按鈕標成「可點」（YouTube Music 清單常見），
+                    // 就把有文字的項目當成可選目標，點選時改用模擬觸控。
+                    out.add(Cand(n, r, true))
+                }
+            }
         }
         for (i in 0 until n.childCount) {
             val c = n.getChild(i) ?: continue
-            walk(c, out, screenArea, depth + 1, budget)
+            walk(c, out, screenArea, depth + 1, budget, ancestorActionable || added)
         }
     }
+
+    private fun hasLabel(n: AccessibilityNodeInfo): Boolean =
+        !n.text.isNullOrBlank() || !n.contentDescription.isNullOrBlank()
 
     private fun isActionable(n: AccessibilityNodeInfo): Boolean =
         n.isClickable || n.isCheckable ||
@@ -409,8 +457,13 @@ class RemoteNavService : AccessibilityService() {
 
     private fun editingText(): Boolean {
         return try {
-            val imeUp = windows.any { it.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD }
-            imeUp && rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)?.isEditable == true
+            val ime = windows.firstOrNull { it.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD }
+                ?: return false
+            val b = Rect()
+            ime.getBoundsInScreen(b)
+            if (b.height() < 120) return false // 輸入法視窗實際上沒有顯示
+            val f = rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+            f != null && f.isEditable && f.isFocused && f.isVisibleToUser
         } catch (e: Exception) {
             false
         }

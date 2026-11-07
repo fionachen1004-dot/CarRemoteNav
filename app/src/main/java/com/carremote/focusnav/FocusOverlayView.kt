@@ -24,6 +24,19 @@ class FocusOverlayView(context: Context) : View(context) {
     private var shown = false
     private var pulse = 0f
     private var moveAnim: ValueAnimator? = null
+    private var debugReal: List<Rect> = emptyList()
+    private var debugSoft: List<Rect> = emptyList()
+
+    private val debugRealPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 2f * density
+        color = 0xFFFFD600.toInt()
+    }
+    private val debugSoftPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 2f * density
+        color = 0xFF00E5FF.toInt()
+    }
 
     private val radius = 12f * density
 
@@ -70,6 +83,13 @@ class FocusOverlayView(context: Context) : View(context) {
         }
     }
 
+    /** 診斷模式：畫出偵測到的所有項目（黃＝可點、青＝只有文字）。 */
+    fun setDebug(real: List<Rect>, soft: List<Rect>) {
+        debugReal = real
+        debugSoft = soft
+        invalidate()
+    }
+
     fun hideFrame() {
         moveAnim?.cancel()
         shown = false
@@ -88,9 +108,21 @@ class FocusOverlayView(context: Context) : View(context) {
         }
     }
 
+    private fun drawBox(canvas: Canvas, r: Rect, paint: Paint) {
+        canvas.drawRect(
+            (r.left - loc[0]).toFloat(),
+            (r.top - loc[1]).toFloat(),
+            (r.right - loc[0]).toFloat(),
+            (r.bottom - loc[1]).toFloat(),
+            paint
+        )
+    }
+
     override fun onDraw(canvas: Canvas) {
-        if (!shown) return
         getLocationOnScreen(loc)
+        for (r in debugReal) drawBox(canvas, r, debugRealPaint)
+        for (r in debugSoft) drawBox(canvas, r, debugSoftPaint)
+        if (!shown) return
         val grow = (3f + 5f * pulse) * density
         drawRect.set(
             rect.left - loc[0] - grow,

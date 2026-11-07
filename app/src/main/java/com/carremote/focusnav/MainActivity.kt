@@ -59,6 +59,15 @@ class MainActivity : Activity() {
         }
         root.addView(toggle)
 
+        val debugSwitch = Switch(this).apply {
+            text = "診斷模式（畫出偵測到的所有項目）"
+            textSize = 18f
+            isChecked = RemoteNavService.debugBoxes
+            setPadding(0, pad / 2, 0, pad / 2)
+            setOnCheckedChangeListener { _, on -> RemoteNavService.applyDebug(this@MainActivity, on) }
+        }
+        root.addView(debugSwitch)
+
         val openBtn = Button(this).apply {
             text = "開啟無障礙設定"
             textSize = 20f
